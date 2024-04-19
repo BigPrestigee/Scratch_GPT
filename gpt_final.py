@@ -71,6 +71,7 @@ def evaluate_loss():
     model.train()  # 模型回到训练模式，使得dropout和batch normalization等再次生效。
     return out  # 返回包含'train'和'val'平均损失的字典。
 
+# single head attention
 class Head(nn.Module):
     """
         single head
@@ -81,6 +82,12 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        """
+        self.tril == tensor([[1, 0, 0, 0],
+                             [1, 1, 0, 0],
+                             [1, 1, 1, 0],
+                             [1, 1, 1, 1]])
+        """
 
         self.dropout = nn.Dropout(dropout)
 
@@ -91,3 +98,78 @@ class Head(nn.Module):
         # compute the attention scores 
         wei = q @ k.transpose(-2, -1) / (C ** 0.5) # (B,T,H) * (B,H,T) -> (B,T,T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+        # weighted aggregation of values
+        v = self.value(x)
+        out = wei @ v # (B, T, T) * (B, T, H) -> (B, T, H)
+        return out
+    
+# multi-head attention
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        """
+            N 个头, (B, T, H) -> (B, T, N * H)
+            N * H should == n_embd
+        """
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        # paper -> Wo 拼接之后在进行一次映射,实现跨头的信息交互和权重参数化
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        """
+            ???dim = -1
+        """
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+# feed forward network    
+class FeedFoward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd)
+            nn.ReLU()
+            nn.Linear(4 * n_embd, n_embd)
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """
+        transformer block
+    """
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        # split the n_embd into n_head
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.foward = FeedFoward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        """
+            这里采用pre-norm的结构：LayerNorm -> Attention -> Residual -> LayerNorm -> FeedForward -> Residual
+            优点：防止底层信息被淹没，即较大的方差可能会使得淹没底层信息（较小的差异）
+        """
+        x = x + self.sa(self.ln1(x))
+        x = x + self.foward(self.ln2(x))
+        return x
+    
+# super simple bigram model
+class BigramLLM(nn.modules):
+    
+    def __init__(self):
+        super().__init__()
+        """
+            ...
+        """
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        
