@@ -5,7 +5,7 @@ import torch.nn.functional as F
 # hyperparameters
 batch_size = 16 # batch size
 block_size = 32 # what is the maximum context length for predictions????
-max_epochs = 5000 # number of epochs
+max_epochs = 20000 # number of epochs
 eval_interval = 100 # how often to evaluate the model
 learning_rate = 1e-4 # learning rate
 device = 'cuda' if torch.cuda.is_available() else 'cpu' # use GPU if available
@@ -18,7 +18,7 @@ dropout = 0.0
 # define the model
 torch.manual_seed(1337)
 
-with open('inpur.txt', 'r', encoding='utf-8') as f:
+with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # here are all the unique characters that occur in this text
@@ -77,7 +77,7 @@ class Head(nn.Module):
         single head
     """
     def __init__(self, head_size):
-        super.__init__()
+        super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False) # y = ax + b, if bias = False, then b = 0
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
@@ -131,9 +131,9 @@ class FeedFoward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd)
-            nn.ReLU()
-            nn.Linear(4 * n_embd, n_embd)
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(dropout)
         )
     
@@ -163,13 +163,108 @@ class Block(nn.Module):
         return x
     
 # super simple bigram model
-class BigramLLM(nn.modules):
+class BigramLLM(nn.Module):
     
     def __init__(self):
         super().__init__()
-        """
-            ...
-        """
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        # attention block
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
+        # 为啥从n_embd到vocab_size？？64->65
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+    def forward(self, idx, targets = None):
+        # batch size, context length
+        """
+            inputs:
+            torch.Size([4, 8])
+            tensor([[24, 43, 58,  5, 57,  1, 46, 43],
+                    [44, 53, 56,  1, 58, 46, 39, 58],
+                    [52, 58,  1, 58, 46, 39, 58,  1],
+                    [25, 17, 27, 10,  0, 21,  1, 54]])
+            targets:
+            torch.Size([4, 8])
+            tensor([[43, 58,  5, 57,  1, 46, 43, 39],
+                    [53, 56,  1, 58, 46, 39, 58,  1],
+                    [58,  1, 58, 46, 39, 58,  1, 46],
+                    [17, 27, 10,  0, 21,  1, 54, 39]])
+        """
+        B, T = idx.shape
+        tok_embeddings = self.token_embedding_table(idx) # B, T -> B, T, C
+        # [0,...,T-1] -> embeddings -> T, C
+        pos_embeddings = self.position_embedding_table(torch.arange(T, device=device)) # T -> T, C
+        # broadcast the position embeddings to all batches
+        x = tok_embeddings + pos_embeddings
+        # x-> self attention
+        x = self.blocks(x)
+        # final layer norm
+        """
+            为啥最终要进行一次层归一化？
+        """
+        x = self.ln_f(x)
+        logits = self.lm_head(x) # B, T, C -> B, T, vocab_size
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape # B, T, vocab_size？
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
         
+        return logits, loss
+    
+    def generate(self, idx, max_new_tokens):
+        # idx is (B, T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            # 选择每一行最后block_size个元素
+            idx_cond = idx[:, -block_size:]
+            # prediction (idx = idx_cond, target = None)
+            logits, loss = self(idx_cond) # B, T, vocab_size
+            # 取每一行最后一个元素的embedding, 即取取得是43, 58, 1, 54 的embedding
+            """
+                B, T = 4, 8
+                tensor([[24, 43, 58,  5, 57,  1, 46, 43],
+                        [44, 53, 56,  1, 58, 46, 39, 58],
+                        [52, 58,  1, 58, 46, 39, 58,  1],
+                        [25, 17, 27, 10,  0, 21,  1, 54]])
+                B, T, vocab_size = 4, 8, 65
+            """
+            logits = logits[:, -1, :] # (B, vocab_size)
+            probs = F.softmax(logits, dim=-1)
+            # sample a token
+            idx_next = torch.multinomial(probs, num_samples=1) # # (B, 1)
+            idx = torch.cat((idx, idx_next), dim=-1) # (B, T+1)
+
+        return idx
+    
+model = BigramLLM()
+m = model.to(device)
+# print the number of parameters in the model
+print(sum(p.numel() for p in m.parameters())/1e6, 'M')
+
+# optimizer
+optim = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+for iter in range(max_epochs):
+    
+    # print loss every eval_interval iterations
+    if iter % eval_interval == 0 or iter == max_epochs - 1:
+        losses = evaluate_loss()
+        print(f'step {iter}, train loss: {losses["train"]:.4f}, val loss: {losses["val"]:.4f}')
+    
+    # train 
+    xb, yb = get_batch('train')
+
+    # evaluate the loss
+    logits, loss = model(xb, yb)
+    optim.zero_grad()
+    loss.backward()
+    optim.step()
+
+# generate some text
+context = torch.zeros((1, 1), dtype=torch.long).to(device)
+# 返回batch_size中的第一行元素
+print(decode(m.generate(context, max_new_tokens=2000)[0].tolist()))
